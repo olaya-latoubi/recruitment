@@ -1,35 +1,50 @@
-Q1.1 — Re-identification for selective anonymization:
-The approach is straightforward: work only on what the face detector already gives you. YOLO produces bounding boxes-crop those regions and pass each crop through a lightweight face-embedding model. A model such as MobileNetV3-Small can be used to produce a compact embedding for each face, which is then compared against a pre-enrolled gallery using cosine similarity.The decision should follow the application's privacy policy: if the detected face matches an identity that is explicitly allowed to remain visible, it is left unblurred; otherwise, the anonymization filter is applied.
-The ReID model only processes detected face crops, so it does not require another full-frame inference pass. This keeps the additional computational cost relatively low. The actual latency should nevertheless be benchmarked on the target hardware.
-The gallery can store embeddings rather than raw images to reduce unnecessary data storage. However, face embeddings used for identifying individuals can still be sensitive biometric data, so they require appropriate access control, security and retention policies.
-Q1.2 — Depth-based background blurring:
-Run a lightweight monocular depth estimator on the frame to obtain a per-pixel relative depth map. A model such as MiDaS can be considered as a starting point. The depth information can then be combined with foreground information to estimate which regions belong to the background, apply blur to those regions, and keep the foreground unchanged.
-For efficiency, depth estimation does not necessarily need to run on every frame. It could run every N frames, with the result temporally smoothed or propagated between estimates to reduce flickering. The value of N should be selected by benchmarking the trade-off between latency and visual quality.
-If the hardware supports it, depth estimation and face detection can also run in parallel to reduce end-to-end latency.
-As a safety fallback, face bounding boxes from the detector can override the background mask. This ensures that a face is still protected even if the depth model incorrectly classifies that region as background.
-Q1.3 — Improving accuracy on dark skin tones and bald heads:
-I would first perform a structured error analysis rather than immediately assuming that the model architecture is the problem. I would evaluate detection performance separately across relevant conditions such as skin tone, hair coverage, illumination, pose and occlusion, using metrics such as precision, recall and false-negative rate.
-If the analysis shows that some conditions are underrepresented in the training data, I would add representative data and use targeted sampling or realistic augmentation. For example, illumination, exposure, contrast and colour variations could help improve robustness to difficult lighting conditions.
-The important point is to measure subgroup performance separately. An improvement in overall mAP is not sufficient if the false-negative rate remains significantly higher for a particular group or condition.
-Q1.4 — Added bald data, accuracy still not improving:
-Adding more data does not automatically improve model performance. I would investigate several possible causes:
-Annotation quality. The new images may contain inconsistent or inaccurate bounding boxes, especially for difficult poses or occlusions. I would inspect the annotations and measure agreement between annotators where possible.
-Insufficient representation. If the new examples are still a very small part of the complete training distribution, their effect may be limited. Targeted sampling or reweighting could be tested if this is confirmed.
-Distribution mismatch. The new images may not represent the conditions where the model fails. For example, adding high-quality frontal images will not necessarily help with low-light or side-view images.
-Training pipeline issues. I would verify that the new data is actually included in the intended training split, that the labels are correct, and that preprocessing is consistent.
-Model/input limitations. I would check whether faces are too small or difficult to localize at the current input resolution and whether the training configuration is appropriate for the new examples.
-Train/validation leakage. Subject-level overlap between training and validation data should also be checked to ensure that evaluation is measuring real generalization.
-I would start with error analysis of the new successful and failed examples before changing the training strategy.
-Q1.5 — MLOps infrastructure:
-The main constraint here is that this system processes sensitive biometric information, so reproducibility and traceability are particularly important. The infrastructure should be able to answer the question: "what exactly ran in production on this date, and why?" at any point.
-For data and training, DVC handles dataset versioning — every training run is tied to a specific data snapshot, not just a folder path. MLflow tracks experiments and acts as the model registry. The combination means you can always reconstruct what data produced a given model, which is the core audit requirement.
-For deployment, Docker containers are the baseline. I'd keep the face detector and the ReID model in separate containers — not for architectural elegance, but because they have different update cadences. The detector might be retrained every few months as new edge cases emerge; the ReID model changes whenever the enrolled gallery or the embedding space changes. Coupling them into one container means redeploying everything when you only needed to update one. Kubernetes and Triton are worth introducing if latency or throughput targets actually require them (not by default).
-For monitoring, Prometheus and Grafana cover the infrastructure side (latency, GPU utilization, throughput). The more interesting problem is model drift. In a face anonymization system, a drop in detection confidence on live frames is often the first signal that something has changed — lighting conditions, camera angle distributions, demographic shifts in the scene. Tracking the confidence score distribution over time, not just average precision on a static test set, gives you early warning before failures become visible to users.
-For governance, every model that reaches production needs a traceable record: code version, dataset version, training configuration, and disaggregated evaluation results by subgroup. For systems subject to applicable EU AI Act requirements, this traceability can support the required documentation, risk management and monitoring processes. Building it into the deployment pipeline from the start is much less painful than reconstructing it retroactively.
-Q1.6 — End-user experience::
-The thing that matters most in a privacy-sensitive real-time system is that users can see what the system is actually doing. If anonymization is applied as a post-processing step that users only see after the fact, they have no way to catch failures — and in a compliance context, a missed face that wasn't flagged is a much bigger problem than one that was flagged and reviewed.
-Real-time preview is the first priority for that reason. The anonymization effect needs to be visible live, not in a review queue.
-Adjustable anonymization strength matters because the right level varies by context. A broadcaster has different requirements than an internal security team. Operators need to configure this without touching code — otherwise every context change becomes a deployment.
-Uncertainty signaling is where most systems fall short. When detection confidence is low — unusual angle, partial occlusion, poor lighting — the system should surface that visibly rather than quietly passing the frame through. "Anonymized with low confidence" is useful information. Silent success on a difficult frame is not.
-Identity enrollment management needs to be simple if selective anonymization is in use. If adding or removing an identity requires a request to the ML team, the feature will be underused. Authorized operators should be able to manage the gallery themselves through a straightforward interface.
-Failure transparency ties all of this together. Frames that were difficult to process — heavy occlusion, extreme angles, degraded image quality — should be flagged for human review rather than treated as successfully anonymized. The system should be honest about what it did and didn't handle well, especially given the regulatory context.
+
+**Q1.1 — Re-identification for selective anonymization**
+YOLO already gives you the face crops. You don't need another full-frame pass just run each crop through a lightweight embedding model, compare against a pre-enrolled gallery with cosine similarity, and decide: known identity that should stay visible, or anonymize.
+MobileNetV3-Small is a reasonable starting point. The gallery stores embeddings, not raw images, which reduces storage. That said, face embeddings are still biometric data they need proper access control and retention policies, not just a folder on a server.
+Latency depends on hardware. Benchmark it before assuming it's fine.
+
+---
+
+**Q1.2 — Depth-based background blurring**
+
+Run a monocular depth estimator to get a per-pixel depth map, threshold it to separate foreground from background, blur the background, keep the foreground. MiDaS is a reasonable starting point.
+You don't need to run depth estimation every frame. Every N frames with temporal smoothing between estimates works fine  what N should be depends on the target hardware and how much flicker is acceptable. Benchmark it.
+If the hardware supports parallel execution, depth estimation and face detection can run simultaneously. And face bounding boxes from the detector should always override the depth mask — if the depth model misclassifies a face as background, the detector catches it.
+
+---
+
+**Q1.3 — Improving accuracy on dark skin tones and bald heads**
+
+Before changing anything, I'd do a structured error analysis. Break down detection performance by skin tone, hair coverage, illumination, pose, occlusion. Precision, recall, false-negative rate per condition. Without that baseline you're guessing what to fix.
+If specific conditions are underrepresented in training, add data for those conditions specifically and augment — illumination, exposure, contrast, color shifts. Targeted, not random.
+The thing people miss: overall mAP going up is not enough. If false-negative rate on dark skin tones stays high, the model got worse on the thing that actually matters. Measure subgroup performance separately, every time.
+
+---
+
+**Q1.4 — Added bald data, accuracy still not improving**
+
+More data doesn't automatically fix anything. A few places to look:
+Annotation quality first. Bald heads at difficult angles often get inconsistent bounding boxes. Check the new annotations, measure annotator agreement where possible.
+If the new examples are still a tiny fraction of the full dataset, they won't move the needle. Test targeted oversampling or loss reweighting.
+Distribution mismatch is easy to miss. High-quality frontal bald-head images won't help if failures happen in low-light side-view conditions. Check whether the new data actually matches where the model fails.
+Also verify the basics before assuming it's a data problem: is the new data actually in the training split? Are labels and preprocessing consistent? Is there subject-level overlap between training and validation? I've seen all of these cause exactly this symptom.
+Start with error analysis on the new failed examples before touching the training strategy.
+
+---
+
+**Q1.5 — MLOps infrastructure**
+This system processes biometric data, so the infrastructure needs to answer one question at any point: what exactly ran in production on this date, and why.
+DVC for dataset versioning, MLflow for experiment tracking and model registry. Every training run ties to a specific data snapshot. That's the audit trail.
+Docker for deployment. Detector and ReID model in separate containers  not for elegance, but because they change at different rates. The detector gets retrained when new edge cases appear; the ReID model changes when the gallery or embedding space changes. Coupling them means redeploying everything when you only needed to touch one. Kubernetes and Triton only if the scale or latency actually requires them.
+Prometheus and Grafana for infrastructure monitoring. For drift, track detection confidence distributions on live frames over time  a shift there usually shows up before failures become visible in downstream metrics.
+Every production model needs a traceable record: code version, data version, training config, disaggregated evaluation results. Build that into the pipeline from day one. Reconstructing it retroactively for an audit is painful.
+
+---
+**Q1.6 — End-user experience**
+The core problem with most anonymization systems is that users can't see what the system is doing. If a face gets missed and nobody flagged it, nobody knows until it's a compliance issue.
+Real-time preview matters for that reason. The blur needs to be visible live, not in a review queue after the fact.
+Adjustable blur strength because different contexts need different levels. A broadcaster and an internal security team don't have the same requirements. Operators should configure this without touching code.
+When confidence is low — bad angle, occlusion, poor lighting — the system should say so visibly. Passing a difficult frame through silently is the worst outcome. "Processed with low confidence" is useful. Silent success on a frame the model wasn't sure about is not.
+If selective anonymization is in use, gallery management needs to be self-service for authorized operators. If every identity change requires the ML team, the feature stops being used.
+Frames with heavy occlusion or degraded quality should be flagged for human review, not treated as successfully anonymized. The system should be honest about what it handled and what it didn't.
